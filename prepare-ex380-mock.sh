@@ -236,6 +236,7 @@ wait_namespace_deleted() {
 }
 
 log "Starting the classroom exercise"
+cd "$HOME"
 lab start "$LAB_NAME"
 
 log "Logging in as cluster administrator"
