@@ -2,13 +2,15 @@
 set -Eeuo pipefail
 
 # Composite EX380 mock preparation for the Red Hat DO380 classroom.
-# Run `lab start compreview-review` yourself and validate it first.
-# This script does not execute any `lab` command.
+# Version 11: run auth-ldap, validate it, finish it, then start compreview-review.
+# Every lab command runs from HOME. compreview-review remains active for the mock.
 #
 # It preserves the Loki S3 credentials supplied by the lab, but deletes the
 # OADP OBC named "backup" so that the candidate must create it themselves.
 
 LAB_NAME="compreview-review"
+LDAP_LAB_NAME="auth-ldap"
+LDAP_LAB_DIR="$HOME/DO380/labs/$LDAP_LAB_NAME"
 API_URL="https://api.lab.example.com:6443"
 ADMIN_USER="admin"
 ADMIN_PASSWORD="redhatocp"
@@ -25,13 +27,131 @@ RHDS_CA_FILE="$ASSET_DIR/rhds_ca.crt"
 RHDS_CA_EXPECTED_SHA256="50045fdb01427adefe177ebd605876e654888aad13fde8166af314cd4555ff37"
 RHDS_HOST="rhds.lab.example.com"
 RHDS_PORT="636"
+RHDS_BIND_DN="cn=Directory Manager"
+RHDS_BIND_PASSWORD="redhatocp"
+RHDS_USER_DN="uid=kristendelgado,ou=people,dc=example,dc=com"
+RHDS_USER_PASSWORD="redhat123"
+RHDS_GROUP_DN="cn=administrators,ou=people,dc=example,dc=com"
+RHDS_LAB_CA_FILE="$ASSET_DIR/rhds-ca-auth-ldap.crt"
+CURRENT_STAGE="initialization"
 
 log() {
+  CURRENT_STAGE="$*"
   printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
 }
 
 warn() {
   printf '\nWARNING: %s\n' "$*" >&2
+}
+
+trap 'rc=$?; printf "\nERROR: stage [%s] failed at line %s (exit %s). Preparation incomplete.\n" "$CURRENT_STAGE" "$LINENO" "$rc" >&2; exit "$rc"' ERR
+
+run_lab() {
+  local action="$1"
+  local exercise="$2"
+  local rc
+
+  log "Running: lab $action $exercise (from $HOME)"
+  # A blocking call: validation and the next lab run only after this finishes.
+  if (cd "$HOME" && lab "$action" "$exercise"); then
+    printf 'PASS: lab %s %s finished with exit code 0.\n' "$action" "$exercise"
+  else
+    rc=$?
+    printf 'STOP: lab %s %s failed (exit %s). No next stage was started.\n' \
+      "$action" "$exercise" "$rc" >&2
+    return "$rc"
+  fi
+}
+
+check_admin_session() {
+  log "Checking the OpenShift administrator session"
+  if oc whoami >/dev/null 2>&1 && \
+     [[ "$(oc auth can-i '*' '*' --all-namespaces 2>/dev/null)" == "yes" ]]; then
+    printf 'Using the existing cluster-admin session: %s\n' "$(oc whoami)"
+  else
+    oc login -u "$ADMIN_USER" -p "$ADMIN_PASSWORD" "$API_URL"
+  fi
+
+  if [[ "$(oc auth can-i '*' '*' --all-namespaces 2>/dev/null)" != "yes" ]]; then
+    printf 'STOP: The current session does not have cluster-admin access.\n' >&2
+    return 1
+  fi
+}
+
+verify_rhds_data() {
+  local stage="$1"
+  local user_file="$STATE_DIR/ldap-${stage}-user.ldif"
+  local group_file="$STATE_DIR/ldap-${stage}-group.ldif"
+  local bind_file="$STATE_DIR/ldap-${stage}-user-bind.txt"
+
+  log "Validating RHDS data and user credentials: $stage"
+  LDAPTLS_CACERT="$RHDS_CA_FILE" LDAPTLS_REQCERT=demand \
+    ldapsearch -x -LLL -o ldif-wrap=no -o nettimeout=15 -l 20 \
+      -D "$RHDS_BIND_DN" -w "$RHDS_BIND_PASSWORD" \
+      -H "ldaps://$RHDS_HOST:$RHDS_PORT" \
+      -b "ou=people,dc=example,dc=com" \
+      '(uid=kristendelgado)' dn uid cn memberOf > "$user_file"
+
+  LDAPTLS_CACERT="$RHDS_CA_FILE" LDAPTLS_REQCERT=demand \
+    ldapsearch -x -LLL -o ldif-wrap=no -o nettimeout=15 -l 20 \
+      -D "$RHDS_BIND_DN" -w "$RHDS_BIND_PASSWORD" \
+      -H "ldaps://$RHDS_HOST:$RHDS_PORT" \
+      -b "ou=people,dc=example,dc=com" \
+      '(cn=administrators)' dn cn uniqueMember > "$group_file"
+
+  if ! grep -Fxq "dn: $RHDS_USER_DN" "$user_file" || \
+     ! grep -Fxq 'uid: kristendelgado' "$user_file" || \
+     ! grep -Fxq "memberOf: $RHDS_GROUP_DN" "$user_file" || \
+     ! grep -Fxq "dn: $RHDS_GROUP_DN" "$group_file" || \
+     ! grep -Fxq "uniqueMember: $RHDS_USER_DN" "$group_file"; then
+    printf 'STOP: RHDS user/group/membership validation failed after %s.\n' "$stage" >&2
+    printf 'Inspect %s and %s. No LDAP entries were created or modified.\n' \
+      "$user_file" "$group_file" >&2
+    return 1
+  fi
+
+  LDAPTLS_CACERT="$RHDS_CA_FILE" LDAPTLS_REQCERT=demand \
+    ldapwhoami -x -o nettimeout=15 \
+      -H "ldaps://$RHDS_HOST:$RHDS_PORT" \
+      -D "$RHDS_USER_DN" -w "$RHDS_USER_PASSWORD" > "$bind_file"
+  if ! grep -Fxq "dn:$RHDS_USER_DN" "$bind_file"; then
+    printf 'STOP: User bind did not return the expected kristendelgado DN.\n' >&2
+    return 1
+  fi
+
+  printf 'PASS: kristendelgado, administrators, both membership attributes, and user bind.\n'
+}
+
+verify_compreview_materials() {
+  local relative_path
+
+  log "Validating compreview-review materials and Etherpad"
+  for relative_path in \
+    s3bucket.env schedule-db-backup.yaml sso_config.yaml \
+    logging/lokistack.yaml logging/forwarder.yaml \
+    logging/uiplugin.yaml logging/group-role.yaml; do
+    if [[ ! -s "$LAB_DIR/$relative_path" ]]; then
+      printf 'STOP: Required lab material is missing or empty: %s\n' \
+        "$LAB_DIR/$relative_path" >&2
+      return 1
+    fi
+  done
+
+  # Check required fields without printing access or secret keys.
+  if ! bash -c '
+    source "$1"
+    [[ -n "${bucketnames:-}" && -n "${endpoint:-}" &&
+       -n "${access_key_id:-}" && -n "${access_key_secret:-}" ]]
+  ' _ "$LOKI_ENV_SOURCE"; then
+    printf 'STOP: s3bucket.env must contain bucketnames, endpoint, access_key_id, and access_key_secret.\n' >&2
+    return 1
+  fi
+
+  oc get namespace "$LAB_NAME"
+  oc get deployment etherpad -n "$LAB_NAME"
+  oc rollout status deployment/etherpad -n "$LAB_NAME" --timeout=300s
+  oc get route etherpad -n "$LAB_NAME"
+  printf 'PASS: required lab files, Loki credential fields, and Etherpad rollout.\n'
 }
 
 download_rhds_ca() {
@@ -237,27 +357,52 @@ wait_namespace_deleted() {
   return 0
 }
 
-log "Checking the OpenShift administrator session"
-if oc whoami >/dev/null 2>&1 && \
-   [[ "$(oc auth can-i '*' '*' --all-namespaces 2>/dev/null)" == "yes" ]]; then
-  printf 'Using the existing cluster-admin session: %s\n' "$(oc whoami)"
-else
-  log "No active cluster-admin session; logging in as $ADMIN_USER"
-  oc login -u "$ADMIN_USER" -p "$ADMIN_PASSWORD" "$API_URL"
-fi
-
-if [[ "$(oc auth can-i '*' '*' --all-namespaces 2>/dev/null)" != "yes" ]]; then
-  printf 'Current user %s does not have cluster-admin access.\n' \
-    "$(oc whoami 2>/dev/null || printf unknown)" >&2
-  exit 1
-fi
-
 mkdir -p "$ASSET_DIR" "$MATERIAL_DIR" "$STATE_DIR"
 chmod 700 "$MOCK_HOME" "$ASSET_DIR" "$STATE_DIR"
 
-log "Downloading and validating the RHDS CA from GitHub"
+# Preflight before starting either exercise. `lab` must be an executable
+# available to this script, not only an interactive shell alias/function.
+for required_command in lab oc ldapsearch ldapwhoami openssl timeout getent \
+  sha256sum jq python3 git ssh curl; do
+  if ! command -v "$required_command" >/dev/null 2>&1; then
+    printf 'STOP: Required command is unavailable: %s\n' "$required_command" >&2
+    exit 1
+  fi
+done
+
+run_lab start "$LDAP_LAB_NAME"
+
+log "Saving the RHDS CA and auth-ldap materials before lab finish"
+if [[ ! -s "$LDAP_LAB_DIR/rhds_ca.crt" ]]; then
+  printf 'STOP: auth-ldap did not create %s/rhds_ca.crt.\n' "$LDAP_LAB_DIR" >&2
+  exit 1
+fi
+openssl x509 -in "$LDAP_LAB_DIR/rhds_ca.crt" -noout >/dev/null
+install -m 0644 "$LDAP_LAB_DIR/rhds_ca.crt" "$RHDS_LAB_CA_FILE"
+mkdir -p "$MATERIAL_DIR/auth-ldap"
+cp -a "$LDAP_LAB_DIR/." "$MATERIAL_DIR/auth-ldap/"
+
+log "Downloading the GitHub RHDS CA and comparing it with auth-ldap"
 download_rhds_ca
+RHDS_LAB_CA_SHA256="$(openssl x509 -in "$RHDS_LAB_CA_FILE" -outform DER \
+  | sha256sum | awk '{print $1}')"
+if [[ "$RHDS_LAB_CA_SHA256" != "$RHDS_CA_EXPECTED_SHA256" ]]; then
+  printf 'STOP: The CA created by auth-ldap differs from the validated GitHub CA.\n' >&2
+  exit 1
+fi
+printf 'PASS: auth-ldap CA and GitHub CA match.\n'
 verify_rhds_tls
+verify_rhds_data after-auth-ldap-start
+
+run_lab finish "$LDAP_LAB_NAME"
+verify_rhds_tls
+verify_rhds_data after-auth-ldap-finish
+
+run_lab start "$LAB_NAME"
+check_admin_session
+verify_compreview_materials
+verify_rhds_tls
+verify_rhds_data after-compreview-start
 
 log "Saving the original lab materials"
 rm -rf "$MATERIAL_DIR/compreview-review"
@@ -333,7 +478,7 @@ if [[ -n "$LDAP_CA_CM" ]] && oc get configmap "$LDAP_CA_CM" -n openshift-config 
     printf 'GitHub and classroom RHDS certificates match; text formatting differs.\n'
   fi
 else
-  warn "The classroom RHDS CA ConfigMap was not found; the validated GitHub CA will be used."
+  printf 'No previous RHDS IdP CA ConfigMap to compare; auth-ldap and GitHub CAs already matched.\n'
 fi
 
 log "Removing mock LDAP and OIDC providers while preserving the baseline IdP"
@@ -711,10 +856,11 @@ parameters:
     value: openshift-logging
 EOF
 
-if ! oc image info "$EVENTROUTER_IMAGE" >/dev/null 2>&1; then
-  warn "Event Router image could not be verified: $EVENTROUTER_IMAGE"
-  warn "Verify the classroom registry before starting Task 5."
-fi
+# This classroom image has been validated by an actual deployment. A direct
+# `oc image info` from workstation can lack the credentials used by kubelet.
+# Leave deployment to the participant instead of creating a preflight workload.
+printf 'Event Router image: %s\n' "$EVENTROUTER_IMAGE"
+printf 'Template prepared; Event Router will be deployed by the participant in Task 5.\n'
 
 log "Removing exercise-specific AlertmanagerConfig resources"
 if has_resource alertmanagerconfigs.monitoring.coreos.com; then
@@ -850,8 +996,9 @@ oc get nodes "${WORKER_NODES[@]}" \
 oc get pod -n chapter1 -o wide
 
 printf '\nLDAP assets:\n'
-ls -l "$ASSET_DIR/rhds_ca.crt" 2>/dev/null || true
-getent hosts rhds.lab.example.com || true
+ls -l "$RHDS_CA_FILE" "$RHDS_LAB_CA_FILE"
+verify_rhds_tls
+verify_rhds_data after-mock-reset
 
 printf '\nPreparation completed. Mock materials are in: %s\n' "$MOCK_HOME"
 printf 'Start with Task 1. Do not run lab finish %s during the mock.\n' "$LAB_NAME"
