@@ -235,9 +235,20 @@ wait_namespace_deleted() {
   return 0
 }
 
-log "Logging in as cluster administrator"
-oc login -u "$ADMIN_USER" -p "$ADMIN_PASSWORD" "$API_URL"
-test "$(oc whoami)" = "$ADMIN_USER"
+log "Checking the OpenShift administrator session"
+if oc whoami >/dev/null 2>&1 && \
+   [[ "$(oc auth can-i '*' '*' --all-namespaces 2>/dev/null)" == "yes" ]]; then
+  printf 'Using the existing cluster-admin session: %s\n' "$(oc whoami)"
+else
+  log "No active cluster-admin session; logging in as $ADMIN_USER"
+  oc login -u "$ADMIN_USER" -p "$ADMIN_PASSWORD" "$API_URL"
+fi
+
+if [[ "$(oc auth can-i '*' '*' --all-namespaces 2>/dev/null)" != "yes" ]]; then
+  printf 'Current user %s does not have cluster-admin access.\n' \
+    "$(oc whoami 2>/dev/null || printf unknown)" >&2
+  exit 1
+fi
 
 mkdir -p "$ASSET_DIR" "$MATERIAL_DIR" "$STATE_DIR"
 chmod 700 "$MOCK_HOME" "$ASSET_DIR" "$STATE_DIR"
@@ -367,9 +378,10 @@ log "Resetting the client certificate exercise"
 delete_crb_for_subject Group cluster-monitoring-app
 oc delete group cluster-monitoring-app --ignore-not-found 2>/dev/null || true
 
-oc get csr -o name 2>/dev/null \
-  | sed 's#certificatesigningrequest.certificates.k8s.io/##' \
-  | grep -E '^(mon-cert-csr|mon-punit|infra-observer-access|audit-reader-access)$' \
+oc get csr -o json 2>/dev/null \
+  | jq -r '
+      .items[].metadata.name
+      | select(test("^(mon-cert-csr|mon-punit|infra-observer-access|audit-reader-access)$"))' \
   | xargs -r oc delete csr
 
 rm -rf "$MOCK_HOME/mon-punit"
@@ -472,6 +484,38 @@ uninstall_subscription openshift-gitops-operator openshift-gitops-operator
 
 oc delete namespace openshift-gitops --ignore-not-found --wait=false || true
 oc delete namespace openshift-gitops-operator --ignore-not-found --wait=false || true
+
+# Argo CD can recreate managed resources for a few seconds while its namespace
+# is terminating. Wait for its controllers to stop, then repeat the OADP CR
+# cleanup so the mock always starts without a pre-created DPA.
+oc wait --for=delete namespace/openshift-gitops \
+  --timeout=240s 2>/dev/null || true
+
+if has_resource dataprotectionapplications.oadp.openshift.io; then
+  oc delete dataprotectionapplications.oadp.openshift.io --all \
+    -n openshift-adp --ignore-not-found --wait=false || true
+
+  for _ in {1..15}; do
+    if ! oc get dataprotectionapplications.oadp.openshift.io \
+      -n openshift-adp -o name 2>/dev/null | grep -q .; then
+      break
+    fi
+    sleep 2
+  done
+
+  # If the OADP operator disappeared before processing its finalizer, remove
+  # only the finalizer from the DPA that this reset is explicitly deleting.
+  oc get dataprotectionapplications.oadp.openshift.io \
+    -n openshift-adp -o name 2>/dev/null \
+    | while read -r resource; do
+        [[ -n "$resource" ]] || continue
+        warn "Removing the stale finalizer from $resource."
+        oc patch "$resource" -n openshift-adp \
+          --type=merge -p '{"metadata":{"finalizers":null}}' || true
+        oc delete "$resource" -n openshift-adp \
+          --ignore-not-found --wait=false || true
+      done
+fi
 
 log "Removing the previous GitLab mock repository when stored credentials permit it"
 GIT_CREDENTIAL="$(printf 'protocol=https\nhost=git.lab.example.com\n\n' \
@@ -767,6 +811,14 @@ printf '  endpoint : %s\n' "$LOKI_ENDPOINT"
 printf '\nOADP reset:\n'
 oc get obc -n openshift-adp 2>/dev/null || true
 oc get dpa -n openshift-adp 2>/dev/null || true
+
+if has_resource dataprotectionapplications.oadp.openshift.io && \
+  oc get dataprotectionapplications.oadp.openshift.io \
+    -n openshift-adp -o name 2>/dev/null | grep -q .; then
+  printf '\nERROR: A DataProtectionApplication still exists after the reset.\n' >&2
+  printf 'Inspect it with: oc get dpa -n openshift-adp -o yaml\n' >&2
+  exit 1
+fi
 
 printf '\nRemaining target operator subscriptions (expected: none):\n'
 oc get subscriptions.operators.coreos.com -A -o json 2>/dev/null \
