@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 
 # Composite EX380 mock preparation for the Red Hat DO380 classroom.
-# This script intentionally resets exercise answers without running:
-#    lab start compreview-review
+# Run `lab start compreview-review` yourself and validate it first.
+# This script does not execute any `lab` command.
 #
 # It preserves the Loki S3 credentials supplied by the lab, but deletes the
 # OADP OBC named "backup" so that the candidate must create it themselves.
@@ -236,7 +236,6 @@ wait_namespace_deleted() {
 }
 
 log "Logging in as cluster administrator"
-cd "$HOME"
 oc login -u "$ADMIN_USER" -p "$ADMIN_PASSWORD" "$API_URL"
 test "$(oc whoami)" = "$ADMIN_USER"
 
