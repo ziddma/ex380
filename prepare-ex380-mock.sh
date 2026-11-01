@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 
 # Composite EX380 mock preparation for the Red Hat DO380 classroom.
-# Version 11: run auth-ldap, validate it, finish it, then start compreview-review.
+# Version 12: tolerate LDAP Who Am I response spacing and case differences.
+# Run auth-ldap, validate it, finish it, then start compreview-review.
 # Every lab command runs from HOME. compreview-review remains active for the mock.
 #
 # It preserves the Loki S3 credentials supplied by the lab, but deletes the
@@ -114,8 +115,13 @@ verify_rhds_data() {
     ldapwhoami -x -o nettimeout=15 \
       -H "ldaps://$RHDS_HOST:$RHDS_PORT" \
       -D "$RHDS_USER_DN" -w "$RHDS_USER_PASSWORD" > "$bind_file"
-  if ! grep -Fxq "dn:$RHDS_USER_DN" "$bind_file"; then
+  # The classroom RHDS may return `dn: uid=...` instead of `dn:uid=...`.
+  # Accept formatting/case variations of this fixed classroom DN, but still
+  # reject anonymous responses, different identities, and failed bind commands.
+  if ! grep -Eixq "[[:space:]]*dn:[[:space:]]*$RHDS_USER_DN[[:space:]]*" "$bind_file"; then
     printf 'STOP: User bind did not return the expected kristendelgado DN.\n' >&2
+    printf 'Expected DN: %s\nActual response:\n' "$RHDS_USER_DN" >&2
+    cat "$bind_file" >&2
     return 1
   fi
 
