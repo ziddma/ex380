@@ -109,7 +109,9 @@ verify_rhds_tls() {
 }
 
 has_resource() {
-  oc api-resources -o name 2>/dev/null | grep -Fxq "$1"
+  # Do not use grep -q here. With pipefail enabled, grep can close the pipe
+  # early and make `oc api-resources` return SIGPIPE, producing a false result.
+  oc api-resources -o name 2>/dev/null | grep -Fx "$1" >/dev/null
 }
 
 delete_crb_for_subject() {
@@ -458,6 +460,16 @@ oc label volumesnapshotclass --all \
   velero.io/csi-volumesnapshot-class- 2>/dev/null || true
 
 log "Resetting GitOps and OIDC exercise resources"
+
+# Stop reconciliation first so Argo CD cannot recreate resources while this
+# reset removes the objects that it previously managed.
+if oc get namespace openshift-gitops >/dev/null 2>&1; then
+  oc scale statefulset --all -n openshift-gitops --replicas=0 \
+    --timeout=60s 2>/dev/null || true
+  oc scale deployment --all -n openshift-gitops --replicas=0 \
+    --timeout=60s 2>/dev/null || true
+fi
+
 if has_resource applications.argoproj.io; then
   oc get applications.argoproj.io -A -o json 2>/dev/null \
     | jq -r '.items[] | [.metadata.namespace, .metadata.name] | @tsv' \
@@ -485,19 +497,16 @@ uninstall_subscription openshift-gitops-operator openshift-gitops-operator
 oc delete namespace openshift-gitops --ignore-not-found --wait=false || true
 oc delete namespace openshift-gitops-operator --ignore-not-found --wait=false || true
 
-# Argo CD can recreate managed resources for a few seconds while its namespace
-# is terminating. Wait for its controllers to stop, then repeat the OADP CR
-# cleanup so the mock always starts without a pre-created DPA.
-oc wait --for=delete namespace/openshift-gitops \
-  --timeout=240s 2>/dev/null || true
-
-if has_resource dataprotectionapplications.oadp.openshift.io; then
+# Repeat the DPA cleanup after stopping Argo CD. This covers a DPA recreated
+# between the initial OADP reset and the GitOps shutdown.
+if [[ -n "$(oc get dataprotectionapplications.oadp.openshift.io \
+  -n openshift-adp -o name 2>/dev/null || true)" ]]; then
   oc delete dataprotectionapplications.oadp.openshift.io --all \
     -n openshift-adp --ignore-not-found --wait=false || true
 
   for _ in {1..15}; do
-    if ! oc get dataprotectionapplications.oadp.openshift.io \
-      -n openshift-adp -o name 2>/dev/null | grep -q .; then
+    if [[ -z "$(oc get dataprotectionapplications.oadp.openshift.io \
+      -n openshift-adp -o name 2>/dev/null || true)" ]]; then
       break
     fi
     sleep 2
@@ -812,9 +821,8 @@ printf '\nOADP reset:\n'
 oc get obc -n openshift-adp 2>/dev/null || true
 oc get dpa -n openshift-adp 2>/dev/null || true
 
-if has_resource dataprotectionapplications.oadp.openshift.io && \
-  oc get dataprotectionapplications.oadp.openshift.io \
-    -n openshift-adp -o name 2>/dev/null | grep -q .; then
+if [[ -n "$(oc get dataprotectionapplications.oadp.openshift.io \
+  -n openshift-adp -o name 2>/dev/null || true)" ]]; then
   printf '\nERROR: A DataProtectionApplication still exists after the reset.\n' >&2
   printf 'Inspect it with: oc get dpa -n openshift-adp -o yaml\n' >&2
   exit 1
